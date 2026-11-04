@@ -126,6 +126,68 @@ fn erf(x: f64) -> f64 {
 	sign * y
 }
 
+/// Gaussian PSF derived from a requested MTF10 (port of `generator.py`).
+///
+/// A Gaussian PSF with standard deviation σ (pixels) has the MTF
+/// `MTF(f) = exp(−2π²σ²f²)`, f in cycles/pixel. Solving `MTF(f) = level` gives
+/// `f = sqrt(−ln level) / (√2·π·σ)`, so MTF10 fixes σ and MTF50 follows from it.
+#[derive(Clone, Copy, Debug)]
+pub struct Psf {
+	pub sigma: f64,             // PSF standard deviation, pixels
+	pub fwhm: f64,              // PSF full width at half maximum, pixels
+	pub mtf10_lp_per_mm: f64,   // forward-computed MTF10 (equals the request)
+	pub mtf50_lp_per_mm: f64,   // forward-computed MTF50
+	pub nyquist_lp_per_mm: f64, // 0.5 cycles/pixel
+	pub mtf10_of_nyquist: f64,  // MTF10 / Nyquist, %
+	pub mtf50_of_nyquist: f64,  // MTF50 / Nyquist, %
+}
+
+/// Derives the Gaussian PSF from the requested MTF10 (lp/mm) at the given
+/// resolution (µm/pix). Fails for non-positive inputs or MTF10 above Nyquist.
+pub fn psf_from_mtf10(mtf10_lp_per_mm: f64, resolution_um: f64) -> Result<Psf, String> {
+	if !(mtf10_lp_per_mm > 0.0) {
+		return Err("MTF10 must be greater than 0 lp/mm".to_owned());
+	}
+
+	if !(resolution_um > 0.0) {
+		return Err("Resolution must be greater than 0 µm/pix".to_owned());
+	}
+
+	use std::f64::consts::{LN_2, LN_10, PI, SQRT_2};
+
+	// lp/mm ↔ cycles/pixel: f_px = f_mm · resolution_um / 1000.
+	let to_cycles_per_pixel = resolution_um / 1000.0;
+
+	let mtf10 = mtf10_lp_per_mm * to_cycles_per_pixel;
+
+	let nyquist = 0.5;
+
+	if mtf10 > nyquist {
+		return Err(format!(
+			"MTF10 {mtf10_lp_per_mm} lp/mm exceeds Nyquist ({:.3} lp/mm) at {resolution_um} µm/pix",
+			nyquist / to_cycles_per_pixel
+		));
+	}
+
+	let sigma = LN_10.sqrt() / (SQRT_2 * PI * mtf10);
+
+	let fwhm = sigma * 2.0 * (2.0 * LN_2).sqrt();
+
+	let mtf50 = LN_2.sqrt() / (SQRT_2 * PI * sigma);
+
+	let mtf10_check = LN_10.sqrt() / (SQRT_2 * PI * sigma);
+
+	Ok(Psf {
+		sigma,
+		fwhm,
+		mtf10_lp_per_mm: mtf10_check / to_cycles_per_pixel,
+		mtf50_lp_per_mm: mtf50 / to_cycles_per_pixel,
+		nyquist_lp_per_mm: nyquist / to_cycles_per_pixel,
+		mtf10_of_nyquist: 100.0 * mtf10_check / nyquist,
+		mtf50_of_nyquist: 100.0 * mtf50 / nyquist,
+	})
+}
+
 // Antiderivative of sqrt(r^2 - t^2), valid for t in [-r, r].
 fn circle_integral(r: f64, t: f64) -> f64 {
 	let t = t.clamp(-r, r);
@@ -192,7 +254,12 @@ fn circle_rect_area(cx: f64, cy: f64, r: f64, x0: f64, x1: f64, y0: f64, y1: f64
 /// Fills the buffer with a circular test pattern of Gaussian noise:
 /// - background at `mean_background`/`stddev_background`,
 /// - filled circle of `diameter` pixels at `mean_circle`/`stddev_circle`,
-/// - transition between the two governed by a Gaussian with `transition_sigma` (pixels),
+/// - edge blurred by a Gaussian PSF with `psf_sigma` (pixels), usually derived from
+///   the requested MTF10 by [`psf_from_mtf10`]: the blend weight is the Gaussian CDF
+///   of the distance from the ideal edge, i.e. the ideal disk convolved with the PSF
+///   (edge-spread function) sampled at the pixel center — the analytic equivalent of
+///   `gaussian_filter` in `generator.py`, without the stair-stepped binary mask.
+///   Noise is added after the blur, as in `generator.py`,
 /// - cupping: the circle is darker in the middle by `cupping` percent of the
 ///   mean difference between circle and background (0 % = flat circle); the
 ///   dip fades to zero toward the circle edge and, because the cupping falloff is
@@ -200,10 +267,10 @@ fn circle_rect_area(cx: f64, cy: f64, r: f64, x0: f64, x1: f64, y0: f64, y1: f64
 ///   tail also extends into the background just outside the circle — so the
 ///   first derivative of a radial profile is non-zero on both sides.
 ///
-/// When `transition_sigma` is 0 the edge is sharp: the blend weight equals the
+/// When `psf_sigma` is 0 the edge is sharp: the blend weight equals the
 /// exact fraction of each pixel's area covered by the circle, so a boundary
 /// cutting a pixel in half gives an intensity that is the area-weighted mean of
-/// circle and background (no stair-step). When `transition_sigma` > 0 a Gaussian
+/// circle and background (no stair-step). When `psf_sigma` > 0 a Gaussian
 /// soft edge is used instead.
 pub fn gen_noise(
 	image: &mut [u16],
@@ -215,7 +282,7 @@ pub fn gen_noise(
 	mean_circle: f64,
 	stddev_circle: f64,
 	cupping: f64,
-	transition_sigma: f64,
+	psf_sigma: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	if image.len() != width * height {
 		return Err("image buffer size does not match width*height".into());
@@ -248,27 +315,27 @@ pub fn gen_noise(
 			//   outside (s > 0): a smooth exponential tail that starts at 0 at the edge,
 			//   goes negative and decays back to 0, so the cupping gradient also appears
 			//   in the background just outside the circle (first derivative != 0 on both
-			//   sides). The tail width is governed by `transition_sigma`.
+			//   sides). The tail width is governed by `psf_sigma`.
 			let s = dist - radius;
 			let cupping_falloff = if s <= 0.0 {
 				// Inside the circle: full dip at the center, none at the edge.
 				let d = dist / radius;
 				1.0 - d * d
 			} else {
-				// Outside the circle: smooth tail, width = transition_sigma.
-				let w = transition_sigma.max(1e-6);
+				// Outside the circle: smooth tail, width = psf_sigma.
+				let w = psf_sigma.max(1e-6);
 				(-2.0 / radius) * s * (-(s / w)).exp()
 			};
 
 			// Blend weight `t` = fraction of the pixel's area covered by the circle.
-			// - transition_sigma > 0: Gaussian soft edge (existing behaviour).
-			// - transition_sigma == 0: sharp edge, but instead of a hard 0/1 step the
+			// - psf_sigma > 0: Gaussian soft edge (existing behaviour).
+			// - psf_sigma == 0: sharp edge, but instead of a hard 0/1 step the
 			//   weight equals the exact area of circle ∩ pixel, so a boundary cutting a
 			//   pixel in half yields t = 0.5 and the intensity is the area-weighted mean
 			//   of circle and background (no stair-step).
 			let sqrt2_over_2 = std::f64::consts::SQRT_2 / 2.0;
-			let t = if transition_sigma > 0.0 {
-				0.5 * (1.0 + erf((radius - dist) / (transition_sigma * std::f64::consts::SQRT_2)))
+			let t = if psf_sigma > 0.0 {
+				0.5 * (1.0 + erf((radius - dist) / (psf_sigma * std::f64::consts::SQRT_2)))
 			} else if dist + sqrt2_over_2 <= radius {
 				// Entire pixel inside the circle.
 				1.0
@@ -324,8 +391,9 @@ fn write_tiff<W: std::io::Write + std::io::Seek>(
 		return Err("image buffer size does not match width*height".into());
 	}
 
-	// Pixels per centimeter = 10 / spacing (mm/pix), exact to 0.001 mm.
-	let denominator = (pixel_spacing * 1000.0).round().max(1.0) as u32;
+	// Pixels per centimeter = 10 / spacing (mm/pix) = 1e7 / spacing (nm/pix), exact
+	// to 1 nm (µm-scale voxels need sub-µm precision).
+	let denominator = (pixel_spacing * 1_000_000.0).round().clamp(1.0, u32::MAX as f64) as u32;
 
 	let mut tiff = TiffEncoder::new(writer)?;
 
@@ -333,13 +401,26 @@ fn write_tiff<W: std::io::Write + std::io::Seek>(
 
 	encoder.resolution_unit(ResolutionUnit::Centimeter);
 
-	encoder.x_resolution(Rational { n: 10_000, d: denominator });
+	encoder.x_resolution(Rational { n: 10_000_000, d: denominator });
 
-	encoder.y_resolution(Rational { n: 10_000, d: denominator });
+	encoder.y_resolution(Rational { n: 10_000_000, d: denominator });
 
 	encoder.write_data(image)?;
 
 	Ok(())
+}
+
+// Pixel Spacing (0028,0030) value "row\column" in mm. DS values are limited to 16
+// characters, so the spacing is rounded to 1e-9 mm and trailing zeros are dropped
+// (e.g. 1 µm → "0.001").
+fn pixel_spacing_ds(pixel_spacing: f64) -> String {
+	let mut value = format!("{pixel_spacing:.9}");
+
+	if value.contains('.') {
+		value = value.trim_end_matches('0').trim_end_matches('.').to_owned();
+	}
+
+	format!("{value}\\{value}")
 }
 
 // Saves the image as a 16-bit TIFF with resolution tags (native version).
@@ -467,7 +548,7 @@ fn save_dicom(
 	obj.put(DataElement::new(
 		Tag(0x0028, 0x0030),
 		VR::DS,
-		PrimitiveValue::from(format!("{}\\{}", pixel_spacing, pixel_spacing)),
+		PrimitiveValue::from(pixel_spacing_ds(pixel_spacing)),
 	));
 
 	obj.put(DataElement::new(Tag(0x0028, 0x0002), VR::US, PrimitiveValue::from(1u16)));
@@ -528,7 +609,7 @@ fn save_dicom(
 	obj.put(DataElement::new(
 		Tag(0x0028, 0x0030),
 		VR::DS,
-		PrimitiveValue::from(format!("{}\\{}", pixel_spacing, pixel_spacing)),
+		PrimitiveValue::from(pixel_spacing_ds(pixel_spacing)),
 	));
 
 	obj.put(DataElement::new(Tag(0x0028, 0x0002), VR::US, PrimitiveValue::from(1u16)));
@@ -596,15 +677,13 @@ struct App {
 	circle_stddev: f64,     // noise std deviation inside the circle (1000)
 	circle_diameter: usize, // circle diameter, pixels (700)
 	cupping: f64,           // dip of the circle center, % of the circle-background difference (0)
-	transition_sigma: f64,  // Gaussian transition width, pixels (3.0)
+
+	// Sharpness (the Gaussian PSF sigma is derived from these, see `psf_from_mtf10`):
+	mtf10: f64,         // requested MTF10, lp/mm (50)
+	resolution_um: f64, // pixel size, µm/pix (1.0); also written to TIFF/DICONDE in mm
 
 	// Output metadata:
 	patient_name: String, // written to DICONDE as Patient Name (0010,0010)
-	pixel_spacing: f64,   // resolution, mm/pix
-
-	// Histogram of the generated image: 256 bins over the 0..=65535 gray range,
-	// recomputed whenever a new image is stored.
-	histogram: Vec<u64>,
 
 	// View: zoom = 1.0 fits the image to the image area; pan offsets it from there.
 	zoom: f32,
@@ -621,7 +700,6 @@ impl Default for App {
 		Self {
 			image: None,
 			texture: None,
-			histogram: Vec::new(),
 			image_size: 1000,
 			background_mean: 20000.0,
 			background_stddev: 500.0,
@@ -629,9 +707,9 @@ impl Default for App {
 			circle_stddev: 1000.0,
 			circle_diameter: 700,
 			cupping: 0.0,
-			transition_sigma: 3.0,
+			mtf10: 50.0,
+			resolution_um: 1.0,
 			patient_name: String::new(),
-			pixel_spacing: 0.1,
 			zoom: 1.0,
 			pan: egui::Vec2::ZERO,
 			pending_zoom: None,
@@ -645,18 +723,6 @@ impl App {
 	// Stores a newly generated image and builds the preview texture.
 	fn set_image(&mut self, image: DynamicImage, ctx: &egui::Context) {
 		let texture = make_preview(ctx, &image);
-
-		// Count the gray levels into 256 bins over the 0..=65535 range (each bin
-		// covers 256 gray levels; bin = value >> 8):
-		let mut histogram = [0u64; 256];
-
-		if let Some(gray) = image.as_luma16() {
-			for &value in gray.as_raw() {
-				histogram[(value >> 8) as usize] += 1;
-			}
-		}
-
-		self.histogram = histogram.to_vec();
 
 		self.image = Some(image);
 
@@ -700,6 +766,15 @@ impl App {
 			return;
 		}
 
+		let psf = match psf_from_mtf10(self.mtf10, self.resolution_um) {
+			Ok(psf) => psf,
+			Err(e) => {
+				self.status = e;
+
+				return;
+			}
+		};
+
 		let mut buffer = vec![0u16; width * height];
 
 		if let Err(e) = gen_noise(
@@ -712,7 +787,7 @@ impl App {
 			self.circle_mean,
 			self.circle_stddev,
 			self.cupping,
-			self.transition_sigma,
+			psf.sigma,
 		) {
 			self.status = format!("Generation error: {e}");
 
@@ -726,7 +801,10 @@ impl App {
 
 		self.set_image(image, ctx);
 
-		self.status = format!("Generated {width} × {height} image");
+		self.status = format!(
+			"Generated {width} × {height} image, PSF sigma {:.3} px (MTF10 {:.3} lp/mm)",
+			psf.sigma, psf.mtf10_lp_per_mm
+		);
 	}
 
 	// Shows the toolbar (menu bar + quick buttons) and handles global keyboard shortcuts.
@@ -837,6 +915,74 @@ impl App {
 		// 2-column grid keeps all numeric editors on one vertical line while the
 		// labels stay left-aligned:
 		egui::Grid::new("parameters").num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+			// Sharpness: the Gaussian PSF sigma is derived from MTF10 and resolution.
+			let tooltip = "Requested MTF10: spatial frequency at which the MTF drops to 10 %, \
+			               lp/mm. Sets the Gaussian PSF sigma; must not exceed Nyquist";
+
+			ui.label("MTF10, lp/mm").on_hover_text(tooltip);
+
+			ui.add_sized(
+				[100.0, 22.0],
+				egui::DragValue::new(&mut self.mtf10)
+					.speed(0.1)
+					.max_decimals(3)
+					.range(0.001..=f64::INFINITY),
+			)
+			.on_hover_text(tooltip);
+
+			ui.end_row();
+
+			let tooltip = "Resolution (pixel size), µm/pix. Converts MTF10 to cycles/pixel and is \
+			               stored in DICONDE Pixel Spacing (0028,0030, in mm) and the TIFF \
+			               X/YResolution tags";
+
+			ui.label("Resolution, µm/pix").on_hover_text(tooltip);
+
+			ui.add_sized(
+				[100.0, 22.0],
+				egui::DragValue::new(&mut self.resolution_um)
+					.speed(0.01)
+					.max_decimals(3)
+					.range(0.001..=100_000.0),
+			)
+			.on_hover_text(tooltip);
+
+			ui.end_row();
+
+			// Derived (read-only) values, forward-computed from the PSF:
+			match psf_from_mtf10(self.mtf10, self.resolution_um) {
+				Ok(psf) => {
+					ui.weak("PSF sigma / FWHM");
+					ui.weak(format!("{:.3} / {:.3} px", psf.sigma, psf.fwhm));
+					ui.end_row();
+
+					ui.weak("MTF50");
+					ui.weak(format!("{:.3} lp/mm", psf.mtf50_lp_per_mm));
+					ui.end_row();
+
+					ui.weak("Nyquist");
+					ui.weak(format!("{:.3} lp/mm", psf.nyquist_lp_per_mm));
+					ui.end_row();
+
+					ui.weak("MTF10 / MTF50, % Nyq.");
+					ui.weak(format!(
+						"{:.2} / {:.2} %",
+						psf.mtf10_of_nyquist, psf.mtf50_of_nyquist
+					));
+					ui.end_row();
+				}
+				Err(e) => {
+					ui.weak("PSF");
+					ui.colored_label(egui::Color32::from_rgb(0xc0, 0x30, 0x30), "invalid")
+						.on_hover_text(e);
+					ui.end_row();
+				}
+			}
+
+			ui.separator();
+			ui.separator();
+			ui.end_row();
+
 			let tooltip = "Square image side, pixels. Must be larger than the circle diameter";
 
 			ui.label("Image Size").on_hover_text(tooltip);
@@ -921,21 +1067,6 @@ impl App {
 
 			ui.end_row();
 
-			let tooltip = "Width of the Gaussian transition between circle and background, pixels";
-
-			ui.label("Transition Sigma").on_hover_text(tooltip);
-
-			ui.add_sized(
-				[100.0, 22.0],
-				egui::DragValue::new(&mut self.transition_sigma)
-					.speed(0.1)
-					.fixed_decimals(1)
-					.range(0.0..=100.0),
-			)
-			.on_hover_text(tooltip);
-
-			ui.end_row();
-
 			let tooltip = "Cupping. Dips the circle center darker by this percent of the mean \
 			               difference between circle and background; the dip vanishes toward \
 			               the circle edge (0 % = flat circle)";
@@ -952,21 +1083,6 @@ impl App {
 			.on_hover_text(tooltip);
 
 			ui.end_row();
-
-			let tooltip = "Resolution. Physical distance in the component between the center of \
-			               each pixel, specified internally by a numeric pair: adjacent row \
-			               spacing and adjacent column spacing, in mm.";
-
-			ui.label("Resolution").on_hover_text(tooltip);
-
-			ui.add_sized(
-				[100.0, 22.0],
-				egui::DragValue::new(&mut self.pixel_spacing)
-					.speed(0.01)
-					.fixed_decimals(6)
-					.range(0.0..=f64::INFINITY),
-			)
-			.on_hover_text(tooltip);
 		});
 
 		// Generate button below the numeric controls:
@@ -986,38 +1102,49 @@ impl App {
 			);
 		});
 
-		// Histogram — starts right below the parameter content and fills the
-		// whole remaining height down to the panel bottom:
+		// Gaussian PSF plot (port of the 1D PSF plot in `generator.py`) — follows the
+		// current MTF10/resolution live, starts right below the parameter content and
+		// fills the whole remaining height down to the panel bottom:
 		ui.add_space(6.0);
 
-		ui.label(egui::RichText::new("Histogram").strong().size(14.0));
+		ui.label(egui::RichText::new("Gaussian PSF").strong().size(14.0));
 
-		ui.add_space(4.0);
+		match psf_from_mtf10(self.mtf10, self.resolution_um) {
+			Ok(psf) => {
+				ui.weak(format!("FWHM = {:.2} px, sigma = {:.3} px", psf.fwhm, psf.sigma));
 
-		if self.histogram.is_empty() {
-			ui.weak("Generate an image to show its histogram");
-		} else {
-			let bars: Vec<egui_plot::Bar> = self
-				.histogram
-				.iter()
-				.enumerate()
-				.map(|(bin, count)| {
-					egui_plot::Bar::new(bin as f64 + 0.5, *count as f64)
-						.width(0.95)
-						.fill(egui::Color32::from_rgb(0x5a, 0x8a, 0xc8))
-				})
-				.collect();
+				ui.add_space(4.0);
 
-			let chart = egui_plot::BarChart::new("Histogram", bars);
+				// ±5σ as in generator.py, sampled finely enough for a smooth curve and
+				// normalized to unit area (amplitude per pixel).
+				let extent = (5.0 * psf.sigma).ceil();
 
-			egui_plot::Plot::new("histogram_plot")
-				.height(ui.available_height().max(80.0))
-				.x_axis_label("Gray level (bin x 256)")
-				.y_axis_label("Count")
-				.x_axis_formatter(|mark, _range| format!("{}", (mark.value * 256.0) as u32))
-				.show(ui, |plot_ui| {
-					plot_ui.bar_chart(chart);
-				});
+				let samples = 400;
+
+				let norm = 1.0 / (psf.sigma * (2.0 * std::f64::consts::PI).sqrt());
+
+				let points: Vec<[f64; 2]> = (0..=samples)
+					.map(|i| {
+						let x = -extent + 2.0 * extent * i as f64 / samples as f64;
+						[x, norm * (-(x * x) / (2.0 * psf.sigma * psf.sigma)).exp()]
+					})
+					.collect();
+
+				let line = egui_plot::Line::new("PSF", egui_plot::PlotPoints::from(points))
+					.color(egui::Color32::from_rgb(0x5a, 0x8a, 0xc8))
+					.width(2.0);
+
+				egui_plot::Plot::new("psf_plot")
+					.height(ui.available_height().max(80.0))
+					.x_axis_label("Pixel offset")
+					.y_axis_label("Amplitude")
+					.show(ui, |plot_ui| {
+						plot_ui.line(line);
+					});
+			}
+			Err(e) => {
+				ui.weak(e);
+			}
 		}
 
 		generate_clicked.then_some(MenuCommand::Generate)
@@ -1154,7 +1281,7 @@ impl eframe::App for App {
 
 				MenuCommand::SaveTiff => {
 					if let Some(img) = &self.image {
-						match save_tiff(img, self.pixel_spacing) {
+						match save_tiff(img, self.resolution_um / 1000.0) {
 							Ok(Some(msg)) => self.status = msg,
 							Ok(None) => {}
 							Err(e) => self.status = format!("TIFF save error: {e}"),
@@ -1164,7 +1291,7 @@ impl eframe::App for App {
 
 				MenuCommand::SaveDicom => {
 					if let Some(img) = &self.image {
-						match save_dicom(img, &self.patient_name, self.pixel_spacing) {
+						match save_dicom(img, &self.patient_name, self.resolution_um / 1000.0) {
 							Ok(Some(msg)) => self.status = msg,
 							Ok(None) => {}
 							Err(e) => self.status = format!("DICONDE save error: {e}"),
