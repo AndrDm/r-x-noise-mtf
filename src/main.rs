@@ -133,13 +133,9 @@ fn erf(x: f64) -> f64 {
 /// `f = sqrt(−ln level) / (√2·π·σ)`, so MTF10 fixes σ and MTF50 follows from it.
 #[derive(Clone, Copy, Debug)]
 pub struct Psf {
-	pub sigma: f64,             // PSF standard deviation, pixels
-	pub fwhm: f64,              // PSF full width at half maximum, pixels
-	pub mtf10_lp_per_mm: f64,   // forward-computed MTF10 (equals the request)
-	pub mtf50_lp_per_mm: f64,   // forward-computed MTF50
-	pub nyquist_lp_per_mm: f64, // 0.5 cycles/pixel
-	pub mtf10_of_nyquist: f64,  // MTF10 / Nyquist, %
-	pub mtf50_of_nyquist: f64,  // MTF50 / Nyquist, %
+	pub sigma: f64,           // PSF standard deviation, pixels
+	pub mtf10_lp_per_mm: f64, // forward-computed MTF10 (equals the request)
+	pub mtf50_lp_per_mm: f64, // forward-computed MTF50
 }
 
 /// Derives the Gaussian PSF from the requested MTF10 (lp/mm) at the given
@@ -171,21 +167,24 @@ pub fn psf_from_mtf10(mtf10_lp_per_mm: f64, resolution_um: f64) -> Result<Psf, S
 
 	let sigma = LN_10.sqrt() / (SQRT_2 * PI * mtf10);
 
-	let fwhm = sigma * 2.0 * (2.0 * LN_2).sqrt();
-
 	let mtf50 = LN_2.sqrt() / (SQRT_2 * PI * sigma);
 
 	let mtf10_check = LN_10.sqrt() / (SQRT_2 * PI * sigma);
 
 	Ok(Psf {
 		sigma,
-		fwhm,
 		mtf10_lp_per_mm: mtf10_check / to_cycles_per_pixel,
 		mtf50_lp_per_mm: mtf50 / to_cycles_per_pixel,
-		nyquist_lp_per_mm: nyquist / to_cycles_per_pixel,
-		mtf10_of_nyquist: 100.0 * mtf10_check / nyquist,
-		mtf50_of_nyquist: 100.0 * mtf50 / nyquist,
 	})
+}
+
+// Formats a length given in pixels as a physical length: millimeters when that
+// reads well (≥ 0.1 mm, 3 decimals), otherwise micrometers (2 decimals), so small
+// voxels don't produce long runs of zeros after the decimal point in mm.
+fn format_length(pixels: f64, resolution_um: f64) -> String {
+	let um = pixels * resolution_um;
+
+	if um >= 100.0 { format!("{:.3} mm", um / 1000.0) } else { format!("{um:.2} µm") }
 }
 
 // Antiderivative of sqrt(r^2 - t^2), valid for t in [-r, r].
@@ -664,23 +663,39 @@ fn save_dicom(
 	Ok(Some("Downloaded image.dcm".into()))
 }
 
+// Snapshot of every parameter that affects the generated image. The App compares the
+// current values against the snapshot of the displayed image to know whether the
+// image is stale (then the Generate button is highlighted).
+#[derive(Clone, Copy, PartialEq)]
+struct GenParams {
+	image_size: usize,
+	background_mean: f64,
+	background_stddev: f64,
+	circle_mean: f64,
+	circle_stddev: f64,
+	circle_diameter: usize,
+	cupping: f64,
+	mtf10: f64,
+	resolution_um: f64,
+}
+
 struct App {
 	// Generated image:
 	image: Option<DynamicImage>,
 	texture: Option<egui::TextureHandle>,
 
 	// Generator parameters (defaults per the r-x-noise spec):
-	image_size: usize,      // square image side, pixels (1000)
+	image_size: usize,      // square image side, pixels (3000)
 	background_mean: f64,   // gray level outside the circle (20000)
-	background_stddev: f64, // noise std deviation outside the circle (500)
+	background_stddev: f64, // noise std deviation outside the circle (100)
 	circle_mean: f64,       // gray level inside the circle (40000)
-	circle_stddev: f64,     // noise std deviation inside the circle (1000)
-	circle_diameter: usize, // circle diameter, pixels (700)
+	circle_stddev: f64,     // noise std deviation inside the circle (100)
+	circle_diameter: usize, // circle diameter, pixels (2000)
 	cupping: f64,           // dip of the circle center, % of the circle-background difference (0)
 
 	// Sharpness (the Gaussian PSF sigma is derived from these, see `psf_from_mtf10`):
-	mtf10: f64,         // requested MTF10, lp/mm (50)
-	resolution_um: f64, // pixel size, µm/pix (1.0); also written to TIFF/DICONDE in mm
+	mtf10: f64,         // requested MTF10, lp/mm (1.466)
+	resolution_um: f64, // pixel size, µm/pix (50); also written to TIFF/DICONDE in mm
 
 	// Output metadata:
 	patient_name: String, // written to DICONDE as Patient Name (0010,0010)
@@ -693,6 +708,9 @@ struct App {
 	// UI state:
 	status: String,
 	show_about: bool,
+
+	// Parameters of the displayed image (None = nothing generated yet):
+	generated_params: Option<GenParams>,
 }
 
 impl Default for App {
@@ -700,26 +718,48 @@ impl Default for App {
 		Self {
 			image: None,
 			texture: None,
-			image_size: 1000,
+			image_size: 3000,
 			background_mean: 20000.0,
-			background_stddev: 500.0,
+			background_stddev: 100.0,
 			circle_mean: 40000.0,
-			circle_stddev: 1000.0,
-			circle_diameter: 700,
+			circle_stddev: 100.0,
+			circle_diameter: 2000,
 			cupping: 0.0,
-			mtf10: 50.0,
-			resolution_um: 1.0,
+			mtf10: 1.466,
+			resolution_um: 50.0,
 			patient_name: String::new(),
 			zoom: 1.0,
 			pan: egui::Vec2::ZERO,
 			pending_zoom: None,
 			status: String::new(),
 			show_about: false,
+			generated_params: None,
 		}
 	}
 }
 
 impl App {
+	// Current generator parameters (see `GenParams`).
+	fn gen_params(&self) -> GenParams {
+		GenParams {
+			image_size: self.image_size,
+			background_mean: self.background_mean,
+			background_stddev: self.background_stddev,
+			circle_mean: self.circle_mean,
+			circle_stddev: self.circle_stddev,
+			circle_diameter: self.circle_diameter,
+			cupping: self.cupping,
+			mtf10: self.mtf10,
+			resolution_um: self.resolution_um,
+		}
+	}
+
+	// True when the displayed image does not match the current parameters, or no
+	// image has been generated yet.
+	fn image_is_stale(&self) -> bool {
+		self.generated_params != Some(self.gen_params())
+	}
+
 	// Stores a newly generated image and builds the preview texture.
 	fn set_image(&mut self, image: DynamicImage, ctx: &egui::Context) {
 		let texture = make_preview(ctx, &image);
@@ -800,6 +840,8 @@ impl App {
 		);
 
 		self.set_image(image, ctx);
+
+		self.generated_params = Some(self.gen_params());
 
 		self.status = format!(
 			"Generated {width} × {height} image, PSF sigma {:.3} px (MTF10 {:.3} lp/mm)",
@@ -949,35 +991,30 @@ impl App {
 
 			ui.end_row();
 
-			// Derived (read-only) values, forward-computed from the PSF:
+			// Derived (read-only) values: MTF50 (forward-computed from the PSF) and Nyquist.
+			// Nyquist depends only on the resolution, so it stays visible when MTF10 is
+			// invalid (e.g. above Nyquist); MTF50 then shows a red "invalid" hint.
+			let invalid_color = egui::Color32::from_rgb(0xc0, 0x30, 0x30);
+
+			ui.weak("MTF50");
 			match psf_from_mtf10(self.mtf10, self.resolution_um) {
 				Ok(psf) => {
-					ui.weak("PSF sigma / FWHM");
-					ui.weak(format!("{:.3} / {:.3} px", psf.sigma, psf.fwhm));
-					ui.end_row();
-
-					ui.weak("MTF50");
 					ui.weak(format!("{:.3} lp/mm", psf.mtf50_lp_per_mm));
-					ui.end_row();
-
-					ui.weak("Nyquist");
-					ui.weak(format!("{:.3} lp/mm", psf.nyquist_lp_per_mm));
-					ui.end_row();
-
-					ui.weak("MTF10 / MTF50, % Nyq.");
-					ui.weak(format!(
-						"{:.2} / {:.2} %",
-						psf.mtf10_of_nyquist, psf.mtf50_of_nyquist
-					));
-					ui.end_row();
 				}
 				Err(e) => {
-					ui.weak("PSF");
-					ui.colored_label(egui::Color32::from_rgb(0xc0, 0x30, 0x30), "invalid")
-						.on_hover_text(e);
-					ui.end_row();
+					ui.colored_label(invalid_color, "invalid").on_hover_text(e);
 				}
 			}
+			ui.end_row();
+
+			ui.weak("Nyquist");
+			if self.resolution_um > 0.0 {
+				ui.weak(format!("{:.3} lp/mm", 0.5 * 1000.0 / self.resolution_um));
+			} else {
+				ui.colored_label(invalid_color, "invalid")
+					.on_hover_text("Resolution must be greater than 0 µm/pix");
+			}
+			ui.end_row();
 
 			ui.separator();
 			ui.separator();
@@ -1088,8 +1125,25 @@ impl App {
 		// Generate button below the numeric controls:
 		ui.add_space(6.0);
 
-		let generate_clicked =
-			ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Generate")).clicked();
+		// Light-yellow accent while the parameters differ from the displayed image (or
+		// nothing is generated yet); default gray once Generate has succeeded.
+		let generate_button = if self.image_is_stale() {
+			egui::Button::new("Generate")
+				.fill(egui::Color32::from_rgb(0xff, 0xf3, 0xb0))
+				.stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe0, 0xb8, 0x40)))
+		} else {
+			egui::Button::new("Generate")
+		};
+
+		let generate_response = ui.add_sized([ui.available_width(), 30.0], generate_button);
+
+		let generate_clicked = if self.image_is_stale() {
+			generate_response
+				.on_hover_text("Parameters changed — press Generate (Ctrl+G) to update the image")
+				.clicked()
+		} else {
+			generate_response.clicked()
+		};
 
 		ui.separator();
 
@@ -1102,52 +1156,165 @@ impl App {
 			);
 		});
 
-		// Gaussian PSF plot (port of the 1D PSF plot in `generator.py`) — follows the
-		// current MTF10/resolution live, starts right below the parameter content and
-		// fills the whole remaining height down to the panel bottom:
-		ui.add_space(6.0);
+		generate_clicked.then_some(MenuCommand::Generate)
+	}
 
+	// Shows the Gaussian PSF graph (port of the 1D PSF plot in `generator.py`) in its own
+	// panel to the right of the image; follows the current MTF10/resolution live and
+	// fills the whole panel height.
+	fn show_psf(&self, ui: &mut egui::Ui) {
 		ui.label(egui::RichText::new("Gaussian PSF").strong().size(14.0));
 
 		match psf_from_mtf10(self.mtf10, self.resolution_um) {
 			Ok(psf) => {
-				ui.weak(format!("FWHM = {:.2} px, sigma = {:.3} px", psf.fwhm, psf.sigma));
+				// Half widths of the peak-normalized Gaussian at 50 % and 10 % of the maximum:
+				// exp(−x²/2σ²) = level  →  x = σ·sqrt(−2 ln level).
+				let half_width_50 = psf.sigma * (2.0 * std::f64::consts::LN_2).sqrt(); // = FWHM / 2
+				let half_width_10 = psf.sigma * (2.0 * std::f64::consts::LN_10).sqrt();
+
+				let width_50 = 2.0 * half_width_50;
+				let width_10 = 2.0 * half_width_10;
+
+				ui.weak(format!("sigma = {:.3} px", psf.sigma));
+
+				ui.weak(format!(
+					"width @50 % (FWHM) = {:.2} px ({})",
+					width_50,
+					format_length(width_50, self.resolution_um)
+				));
+
+				ui.weak(format!(
+					"width @10 % = {:.2} px ({})",
+					width_10,
+					format_length(width_10, self.resolution_um)
+				));
 
 				ui.add_space(4.0);
 
-				// ±5σ as in generator.py, sampled finely enough for a smooth curve and
-				// normalized to unit area (amplitude per pixel).
-				let extent = (5.0 * psf.sigma).ceil();
+				// ±3σ (PSF ≈ 1 % at the ends): narrow enough that the 50 % and 10 % widths
+				// are well separated on the axis, unlike ±5σ in generator.py.
+				let extent = 3.0 * psf.sigma;
 
 				let samples = 400;
 
-				let norm = 1.0 / (psf.sigma * (2.0 * std::f64::consts::PI).sqrt());
-
+				// Peak-normalized to 100 % (not unit area), so the 50 %/10 % lines read
+				// directly against the vertical scale.
 				let points: Vec<[f64; 2]> = (0..=samples)
 					.map(|i| {
 						let x = -extent + 2.0 * extent * i as f64 / samples as f64;
-						[x, norm * (-(x * x) / (2.0 * psf.sigma * psf.sigma)).exp()]
+						[x, 100.0 * (-(x * x) / (2.0 * psf.sigma * psf.sigma)).exp()]
 					})
 					.collect();
 
+				let psf_color = egui::Color32::from_rgb(0x5a, 0x8a, 0xc8);
+				let color_50 = egui::Color32::from_rgb(0xd0, 0x70, 0x10);
+				let color_10 = egui::Color32::from_rgb(0x30, 0x9a, 0x40);
+
+				let name_50 = format!("50 %: {}", format_length(width_50, self.resolution_um));
+				let name_10 = format!("10 %: {}", format_length(width_10, self.resolution_um));
+
 				let line = egui_plot::Line::new("PSF", egui_plot::PlotPoints::from(points))
-					.color(egui::Color32::from_rgb(0x5a, 0x8a, 0xc8))
+					.color(psf_color)
 					.width(2.0);
+
+				// Tick marks exactly at the center and at the ±50 %/±10 % half widths.
+				// egui_plot hides a label when its mark's `step_size` spans fewer screen
+				// points than the axis label spacing (60 pt for x), so every mark gets the
+				// whole range as step size — that keeps these labels always visible.
+				let x_marks = [-half_width_10, -half_width_50, 0.0, half_width_50, half_width_10];
+
+				let y_marks = [0.0, 10.0, 50.0, 100.0];
+
+				// Unit of the top (physical) axis, chosen like `format_length`: mm when the
+				// widest tick (10 % half width) is ≥ 0.1 mm, otherwise µm.
+				let resolution_um = self.resolution_um;
+				let physical_in_mm = half_width_10 * resolution_um >= 100.0;
+				let physical_unit = if physical_in_mm { "mm" } else { "µm" };
 
 				egui_plot::Plot::new("psf_plot")
 					.height(ui.available_height().max(80.0))
-					.x_axis_label("Pixel offset")
-					.y_axis_label("Amplitude")
+					.y_axis_label("Amplitude, %")
+					.include_x(-extent)
+					.include_x(extent)
+					.include_y(0.0)
+					.include_y(100.0)
+					.allow_zoom(false)
+					.allow_drag(false)
+					.allow_scroll(false)
+					.allow_boxed_zoom(false)
+					.legend(egui_plot::Legend::default())
+					.x_grid_spacer(move |_input| {
+						x_marks
+							.iter()
+							.map(|&value| egui_plot::GridMark { value, step_size: 2.0 * extent })
+							.collect()
+					})
+					.y_grid_spacer(move |_input| {
+						y_marks
+							.iter()
+							.map(|&value| egui_plot::GridMark { value, step_size: 100.0 })
+							.collect()
+					})
+					// Two x axes on the same tick marks: physical offset (mm or µm, one unit
+					// for the whole axis) at the bottom, pixels at the top.
+					.custom_x_axes(vec![
+						egui_plot::AxisHints::new_x()
+							.label("Offset, px")
+							.formatter(|mark, _range| {
+								if mark.value == 0.0 {
+									"0".to_owned()
+								} else {
+									format!("{:.2}", mark.value)
+								}
+							})
+							.placement(egui_plot::VPlacement::Top),
+						egui_plot::AxisHints::new_x()
+							.label(format!("Offset, {physical_unit}"))
+							.formatter(move |mark, _range| {
+								if mark.value == 0.0 {
+									"0".to_owned()
+								} else {
+									let um = mark.value * resolution_um;
+									if physical_in_mm {
+										format!("{:.3}", um / 1000.0)
+									} else {
+										format!("{um:.2}")
+									}
+								}
+							})
+							.placement(egui_plot::VPlacement::Bottom),
+					])
+					.y_axis_formatter(|mark, _range| format!("{:.0} %", mark.value))
 					.show(ui, |plot_ui| {
 						plot_ui.line(line);
+
+						plot_ui.hline(
+							egui_plot::HLine::new(name_50.clone(), 50.0)
+								.color(color_50)
+								.width(1.0_f32),
+						);
+						plot_ui.vline(
+							egui_plot::VLine::new(name_50.clone(), -half_width_50).color(color_50),
+						);
+						plot_ui
+							.vline(egui_plot::VLine::new(name_50, half_width_50).color(color_50));
+
+						plot_ui.hline(
+							egui_plot::HLine::new(name_10.clone(), 10.0)
+								.color(color_10)
+								.width(1.0_f32),
+						);
+						plot_ui.vline(
+							egui_plot::VLine::new(name_10.clone(), -half_width_10).color(color_10),
+						);
+						plot_ui
+							.vline(egui_plot::VLine::new(name_10, half_width_10).color(color_10));
 					});
 			}
 			Err(e) => {
 				ui.weak(e);
 			}
 		}
-
-		generate_clicked.then_some(MenuCommand::Generate)
 	}
 
 	// Shows the status bar (bottom): image source and the last action result.
@@ -1199,6 +1366,15 @@ impl eframe::App for App {
 		egui::Panel::bottom(egui::Id::new("status_bar"))
 			.frame(light_panel_frame())
 			.show(ui, |ui| self.show_status(ui));
+
+		// Gaussian PSF graph (between image and Parameters) — exactly half of the width
+		// left for image + graph, so the image and the graph share it 50/50:
+		let psf_width = ui.available_rect_before_wrap().width() / 2.0;
+
+		egui::Panel::right(egui::Id::new("psf"))
+			.frame(light_panel_frame())
+			.exact_size(psf_width)
+			.show(ui, |ui| self.show_psf(ui));
 
 		// Main content — the image, with wheel zoom (anchored at the pointer) and pan:
 		egui::CentralPanel::default().frame(light_panel_frame()).show(ui, |ui| {
